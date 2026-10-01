@@ -74,7 +74,19 @@ const apiPost = (p, body) =>
 async function apiBlob(path) {
   const res = await fetch(path, { headers: { Authorization: "Basic " + S.auth } });
   if (res.status === 401) { sessionExpired(); throw new Error("登录已失效"); }
-  if (!res.ok) throw new Error("HTTP " + res.status);
+  if (!res.ok) {
+    // 尽量带上服务端的确定性错误文案（如验真包被改动的 409 原因）
+    let detail = "";
+    try {
+      const ct = res.headers.get("content-type") || "";
+      if (ct.includes("json")) {
+        const j = await res.json();
+        detail = typeof j.detail === "object" && j.detail
+          ? (j.detail.message || JSON.stringify(j.detail)) : (j.detail || "");
+      }
+    } catch { /* 忽略错误体解析失败 */ }
+    throw new Error(detail || ("HTTP " + res.status));
+  }
   return res.blob();
 }
 
@@ -621,13 +633,16 @@ const AuditView = {
   async load() {
     const prev = collectAuditFilters();
     const qs = new URLSearchParams(Object.entries(prev).filter(([, v]) => v)).toString();
-    let rows = [], verify = null;
+    let rows = [], verify = null, snaps = null, snapErr = null;
     try {
       [rows, verify] = await Promise.all([
         apiGet("/api/audit" + (qs ? "?" + qs : "")),
         apiGet("/api/audit/verify"),
       ]);
     } catch (e) { $("#view").innerHTML = errPanel(e); return; }
+    // 快照区块独立加载：其失败不影响既有审计查询/导出区块
+    try { snaps = await apiGet("/api/audit/snapshots"); }
+    catch (e) { snapErr = e; }
     const isAdmin = S.me.roles.includes("admin");
     $("#view").innerHTML = `
       <h2>审计记录（哈希链）</h2>
@@ -667,9 +682,80 @@ const AuditView = {
             </tr>`).join("") : emptyRow(8, "无匹配记录")}
           </tbody>
         </table>
-      </div>`;
+      </div>
+      ${snapshotSection(snaps, snapErr, isAdmin)}`;
   },
 };
+
+// ---------- 验真快照区块 ----------
+const SNAP_CHECK_LABELS = [
+  ["pack_file_ok", "包文件 WORM 摘要"],
+  ["manifest_ok", "清单外部锚"],
+  ["records_digests_ok", "记录逐条摘要"],
+  ["frozen_chain_ok", "冻结 HMAC 链"],
+  ["anchor_intact", "截止点链锚"],
+  ["frozen_rows_match_live", "冻结行与现库一致"],
+  ["live_chain_ok", "当前全链完整"],
+];
+
+function snapshotSection(snaps, snapErr, isAdmin) {
+  let idem = sessionStorage.getItem("meddeid_snap_idem") || "";
+  const body = snapErr
+    ? errPanel(snapErr)
+    : `
+    ${isAdmin ? `
+    <div class="card">
+      <h3>冻结验真快照</h3>
+      <div class="banner info">快照由<strong>服务端在确定的审计序号截止点</strong>取数冻结；
+        截止点之后并发写入的审计事件不会混入。同一幂等键重复提交（刷新/重复点击/并发）
+        只返回原快照；筛选无匹配时也会得到记录数为 0 的可核对冻结结果。</div>
+      <div class="toolbar">
+        <label>幂等键 <input id="snap-idem" value="${esc(idem)}"
+          placeholder="留空将自动生成" style="min-width:220px"></label>
+        <button class="btn btn-sm" data-act="snap-newkey" type="button">换新幂等键</button>
+        <span class="hint">使用上方 actor/action/study_id/reid_id 筛选作为快照范围</span>
+        <button class="btn btn-primary" data-act="snap-create">按当前筛选冻结快照</button>
+      </div>
+    </div>` : `
+    <div class="card">
+      <h3>验真快照复核</h3>
+      <span class="hint">隐私官仅可查询与复核快照范围、链锚、记录数与完整性结果；
+        创建与验真包下载为 admin 专属（后端强制）。</span>
+    </div>`}
+    <div class="card" style="padding:0;overflow:auto;">
+      <table>
+        <thead><tr><th>快照</th><th>创建时间</th><th>范围（筛选）</th>
+          <th>截止 seq / 链锚</th><th>记录数</th><th>现场验真</th><th>操作</th></tr></thead>
+        <tbody>${snaps && snaps.length ? snaps.map((s) => `
+          <tr>
+            <td class="mono">${esc(s.id)}</td>
+            <td class="nowrap">${fmtTime(s.created_at)}<div class="hint">${esc(s.created_by)}</div></td>
+            <td><code>${esc(JSON.stringify(s.filters || {}))}</code></td>
+            <td class="mono">
+              #${esc(s.cutoff_seq)}
+              <div class="hint" style="max-width:150px;overflow:hidden;text-overflow:ellipsis;"
+                   title="${esc(s.anchor_mac)}">${esc(s.anchor_mac)}</div></td>
+            <td>${esc(s.record_count)}</td>
+            <td>${snapshotPill(s.verification)}</td>
+            <td class="nowrap">
+              <button class="btn btn-sm" data-act="snap-detail"
+                      data-sid="${esc(s.id)}">验真详情</button>
+              ${isAdmin ? `<button class="btn btn-sm btn-primary" data-act="snap-download"
+                      data-sid="${esc(s.id)}">下载验真包</button>` : ""}
+            </td>
+          </tr>`).join("") : emptyRow(7, "尚无验真快照")}
+        </tbody>
+      </table>
+    </div>`;
+  return `<h2>可冻结验真快照（不可变）</h2>${body}`;
+}
+
+function snapshotPill(v) {
+  if (!v) return pill("unknown", {});
+  if (v.ok) return `<span class="pill ok">验真通过 ✓</span>`;
+  return `<span class="pill bad">异常：${esc(v.reason || "failed")}` +
+    (v.broken_at != null ? ` @seq ${esc(v.broken_at)}` : "") + `</span>`;
+}
 
 function collectAuditFilters() {
   const g = (id) => ($("#" + id)?.value || "").trim();
@@ -905,6 +991,67 @@ document.addEventListener("click", async (e) => {
         await TABS[S.tab].load();
         break;
       }
+      // ---- 验真快照 ----
+      case "snap-newkey": {
+        const k = "idem-" + Date.now().toString(36) + "-" +
+          Math.random().toString(36).slice(2, 10);
+        sessionStorage.setItem("meddeid_snap_idem", k);
+        const el = $("#snap-idem");
+        if (el) el.value = k;
+        break;
+      }
+      case "snap-create": {
+        let idem = ($("#snap-idem")?.value || "").trim();
+        if (!idem) {
+          idem = "idem-" + Date.now().toString(36) + "-" +
+            Math.random().toString(36).slice(2, 10);
+        }
+        // 幂等键在“冻结”动作飞行期间固定：刷新/重复点击/并发都重放同一键
+        sessionStorage.setItem("meddeid_snap_idem", idem);
+        const f = collectAuditFilters();
+        const body = Object.assign({ idempotency_key: idem },
+          Object.fromEntries(Object.entries(f).filter(([, v]) => v)));
+        await withBtn(btn, "snap-create:" + idem, async () => {
+          try {
+            const r = await apiPost("/api/audit/snapshots", body);
+            toast(r.idempotent_replay
+              ? `幂等重放：返回原快照 ${r.id}（记录 ${r.record_count} 条）`
+              : `快照已冻结：${r.id}，截止 seq ${r.cutoff_seq}，记录 ${r.record_count} 条`,
+              "ok");
+          } catch (e) {
+            // 原链被篡改/参数冲突：展示服务端确定状态，不猜测结果
+            toast(errText(e), "bad");
+            throw e;
+          }
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "snap-detail":
+        await openSnapshotDetail(btn.dataset.sid);
+        break;
+      case "snap-download": {
+        const sid = btn.dataset.sid;
+        await withBtn(btn, "snap-download:" + sid, async () => {
+          try {
+            // 专用接口在交付前强制验真；包被改动时服务端 409，不下载被改内容
+            const blob = await apiBlob(`/api/audit/snapshots/${sid}/pack`);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `audit-verify-${sid}.zip`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 4000);
+            toast("验真包已通过交付前验真并开始下载", "ok");
+          } catch (e) {
+            toast("验真包未通过服务端验真，已拒绝下载：" + errText(e), "bad");
+          }
+        });
+        await TABS[S.tab].load();
+        break;
+      }
       case "modal-close":
         closeModal();
         break;
@@ -1082,6 +1229,41 @@ async function openRelinkDetail(rid) {
     ${stepBar(r)}
     <h3>原始记录（无身份内容）</h3>
     <pre>${esc(JSON.stringify(r, null, 2))}</pre>
+    <div class="dlg-actions"><button class="btn" data-act="modal-close">关闭</button></div>`);
+}
+
+async function openSnapshotDetail(sid) {
+  const r = await apiGet(`/api/audit/snapshots/${sid}`);
+  const v = r.verification || {};
+  const checks = SNAP_CHECK_LABELS.map(([key, label]) => `
+    <li class="${v[key] ? "step-ok" : "step-bad"}">${esc(label)}：${v[key] ? "通过 ✓" : "未通过 ✗"}</li>`).join("");
+  openModal(`
+    <h2>验真快照 ${esc(r.id)}</h2>
+    <div class="row" style="margin:6px 0 12px;">
+      ${snapshotPill(v)}
+      <span class="hint">创建于 ${fmtTime(r.created_at)}（${esc(r.created_by)}）</span>
+    </div>
+    <dl class="kv">
+      <dt>幂等键</dt><dd class="mono">${esc(r.idempotency_key)}</dd>
+      <dt>范围筛选</dt><dd><code>${esc(JSON.stringify(r.filters || {}))}</code>
+        ${r.record_count === 0 ? '<span class="pill warn">筛选为空：0 条（仍冻结链锚）</span>' : ""}</dd>
+      <dt>截止审计序号</dt><dd class="mono">#${esc(r.cutoff_seq)} · ${fmtTime(r.cutoff_ts)}</dd>
+      <dt>链锚 MAC</dt><dd class="mono" style="word-break:break-all;">${esc(r.anchor_mac)}</dd>
+      <dt>记录范围</dt><dd class="mono">${esc(r.first_seq ?? "—")} → ${esc(r.last_seq ?? "—")}
+        （${esc(r.record_count)} 条）</dd>
+      <dt>验真包 CAS / 大小</dt><dd class="mono" style="word-break:break-all;">
+        ${esc(r.pack_cas_id)} · ${esc(r.pack_size)} B</dd>
+      <dt>清单 / 记录摘要</dt><dd class="mono" style="word-break:break-all;font-size:12px;">
+        m:${esc(r.manifest_sha256)}<br>r:${esc(r.records_sha256)}</dd>
+    </dl>
+    <h3>现场完整性结果（每次打开由服务端重算）</h3>
+    <ul class="steps">${checks}</ul>
+    ${v.ok ? `<div class="banner">验真通过；截止点之后新增审计事件
+      <strong>${esc(v.new_events_after_cutoff ?? 0)}</strong> 条（不影响冻结结果）。</div>`
+      : `<div class="banner danger">确定性异常：${esc(v.reason || "verification failed")}` +
+        (v.broken_at != null ? `（断裂 seq ${esc(v.broken_at)}）` : "") + `</div>`}
+    <h3>创建时冻结结论</h3>
+    <pre>${esc(JSON.stringify(r.created_integrity, null, 2))}</pre>
     <div class="dlg-actions"><button class="btn" data-act="modal-close">关闭</button></div>`);
 }
 

@@ -18,6 +18,7 @@
 | 导出/撤销竞态 | 状态推进全部为**条件 UPDATE**（`WHERE status=...`，以 rowcount 定胜负），最多一方成功 |
 | 导出后再次访问 | 导出提交成功即**抹除内存分片**；状态 `exported`，二次导出 409；会话密钥不可重组 |
 | 审计抵赖/篡改 | 审计日志 HMAC 哈希链（每条含前一条 MAC），导出时附链完整性校验结果 |
+| 审计结论事后抵赖 | **验真快照**：admin 按筛选与当前审计序号在服务端确定截止点冻结不可变快照（WORM 验真包 + 清单逐级摘要 + 链锚）；幂等键保证刷新/重复点击/并发只返回同一快照；officer 仅查询复核，创建/下载为 admin 专属 |
 
 ## 版本/任务状态机
 
@@ -49,6 +50,7 @@ app/
     vault.py           回链分片内存保险库（TTL）
     reidentify.py      双角色授权、纠错、导出、撤销、过期清扫
     audit.py           审计查询与 JSON/CSV 导出
+    snapshots.py       验真快照：截止点冻结、幂等、WORM 验真包、逐级验真
   web/
     auth.py            Basic 认证与四角色控制
     api.py             REST API + 工作台静态资源（/ 与 /ui/*）
@@ -89,7 +91,8 @@ MEDDEID_HOME=./data uvicorn app.web.api:app --port 8088
 - **技师**：处理队列（执行任务、死信人工重试）、人工质检（去标识 PNG 预览、完整步骤链、放行/否决）、病例与版本（入库、按新策略派生、查看不可变版本链）。
 - **临床医生**：发起回链并安全保存一次性分片 A → 在本会话粘贴提交步骤 1 → 查看后端真实授权进度；仅在 `armed` 时出现登记纠错与导出入口；导出成功后纠错包只显示一次。
 - **隐私官**：在独立会话中查看待批准队列（仅此处返回分片 B，页面不渲染分片），一键提交步骤 2；监督全部回链、按状态筛选、撤销、清扫过期。
-- **管理员**：审计多条件筛选、哈希链重新校验、JSON/CSV 导出并经受 admin 保护的 blob 接口下载；另可只读查看队列/质检、驱动 worker。
+- **管理员**：审计多条件筛选、哈希链重新校验、JSON/CSV 导出并经受 admin 保护的 blob 接口下载；**冻结验真快照**（按当前筛选与审计序号取不可变截止点，查看范围/链锚/记录数/现场完整性并下载含清单与记录的验真包）；另可只读查看队列/质检、驱动 worker。
+- **隐私官**：可在审计页**查询与复核验真快照**（范围、链锚、记录数、完整性结果），但不能创建快照或下载验真包（后端 403 强制）。
 
 > 工作台只**新增**了三个只读恢复接口：`GET /api/me`、`GET /api/relink/mine`、
 > `GET /api/relink/{id}/status`，以及 `/` 与 `/ui/{app.js,styles.css}` 静态资源；
@@ -132,7 +135,33 @@ GET  /api/me                           当前会话真实身份与角色（工�
 GET  /api/audit                        审计查询（officer/admin）
 GET  /api/audit/verify                 HMAC 链完整性校验
 POST /api/audit/export?fmt=json|csv    审计导出（仅 admin）
+
+POST /api/audit/snapshots              冻结验真快照（仅 admin；幂等键+筛选）
+GET  /api/audit/snapshots              快照列表+现场验真结果（officer/admin 复核）
+GET  /api/audit/snapshots/{id}         单快照范围/链锚/记录数/完整性（officer/admin）
+GET  /api/audit/snapshots/{id}/pack    下载验真包 ZIP（仅 admin，交付前强制验真）
 ```
+
+### 验真快照语义
+
+- **服务端截止点**：创建在单个 `BEGIN IMMEDIATE` 事务内完成——确定当时链尾为
+  `cutoff_seq`、校验全链完整、按截止点取数、冻结落包；事务持锁期间并发写入的
+  审计事件被阻塞，绝不混入已冻结结果。截止点之后的新事件只在验真结果中以
+  `new_events_after_cutoff` 报告，不改变快照。
+- **幂等**：`idempotency_key` 唯一约束；同键重发（刷新/重复点击/并发创建）返回原
+  快照并带 `idempotent_replay=true`；同键不同参数返回 409（带回原快照 id）。
+- **筛选为空**：仍冻结当时链锚，返回 `record_count=0` 的可核对快照（空库为
+  GENESIS 锚）。
+- **验真包**（ZIP，`audit-verify-pack/v1`）：`manifest.json`（范围、链锚、逐条
+  记录 sha256、records 根摘要、创建时冻结结论）+ `records.jsonl` + `README.txt`；
+  包落 WORM 内容寻址存储（0444），快照行另存 manifest 外部锚。验真七层：
+  包文件摘要 → 清单外部锚 → 记录逐条摘要 → 冻结 HMAC 链自洽 → 截止点链锚 →
+  冻结行与现库一致 → 当前全链完整。
+- **确定状态**：原链已被篡改时创建被拒（409 `audit_chain_broken`）；验真包文件
+  或内容被改动时详情给断裂层、下载 409 `verify_pack_tampered`，错误文案不含
+  身份内容；通用 `/api/blobs` 接口不提供验真包，必须走带交付前验真的专用接口。
+- 快照内容与既有 `/api/audit` 可见范围一致（仅审计元数据，无原身份）；
+  创建与下载动作本身写入哈希链（`audit.snapshot.create/download`）。
 
 ## 端到端示例
 
@@ -166,10 +195,12 @@ curl -s -u clinician:clinician-pw-123 -XPOST $B/api/relink/$RID/export
 
 ```bash
 python3 -m pytest tests/ -q
-# 35 passed —— 覆盖：冻结/幂等、版本不可变、质检隔离、策略升级、
+# 47 passed —— 覆盖：冻结/幂等、版本不可变、质检隔离、策略升级、
 # 并发修订版本号唯一性、批量领取不重复、租约崩溃接管、重试死信、
 # 双角色授权、错误分片拒绝、导出即失效、撤销/导出竞态五轮、时间窗过期、
-# 网页工作台（服务端状态恢复、独立会话角色隔离、一次性材料、静态资源无数据）
+# 网页工作台（服务端状态恢复、独立会话角色隔离、一次性材料、静态资源无数据）、
+# 验真快照（截止点冻结、幂等重放/冲突、空筛选/空库、并发不混入、
+#   角色边界、原链篡改、验真包文件与内容篡改、既有审计接口不回归）
 ```
 
 ## 部署注意（演示实现的边界）

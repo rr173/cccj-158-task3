@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from ..core import dicomutil, store
 from ..services import (audit as audit_svc, ingest as ingest_svc,
                         policies as policies_svc, queue, reidentify,
-                        versions as versions_svc)
+                        snapshots as snap_svc, versions as versions_svc)
 from .auth import authenticate, require_role
 
 app = FastAPI(title="医学影像去标识化与受控回链平台", version="1.0.0")
@@ -132,6 +132,15 @@ class CorrectionBody(BaseModel):
 
 class RevokeBody(BaseModel):
     reason: str = "privacy officer revocation"
+
+
+class SnapshotBody(BaseModel):
+    idempotency_key: str = Field(..., description="幂等键：同键重发返回原快照")
+    actor: Optional[str] = None
+    action: Optional[str] = None
+    study_id: Optional[str] = None
+    reid_id: Optional[str] = None
+    limit: Optional[int] = Field(None, ge=1, le=100_000)
 
 
 def _conflict(exc: Exception):
@@ -409,8 +418,81 @@ def audit_export(fmt: str = "json", user=Depends(require_role("admin"))):
 
 @app.get("/api/blobs/{cas_id}", tags=["audit"])
 def download_blob(cas_id: str, user=Depends(require_role("admin"))):
+    # 验真包只能走带验真的专用下载接口，通用 blob 接口不提供该类证据包
+    row = store.maybe("SELECT kind FROM objects WHERE cas_id=?", (cas_id,))
+    if row is not None and row["kind"] == "audit_verify_pack":
+        raise HTTPException(status_code=404, detail="use verified pack endpoint")
     try:
         data = store.blob_get(cas_id)
     except store.NotFound:
         raise HTTPException(404, "blob not found")
     return Response(content=data, media_type="application/octet-stream")
+
+
+# ---------- 验真快照（admin 冻结/下载；officer 查询/复核） ----------
+
+def _snap_view(snap: dict, *, replay: bool = False) -> dict:
+    """对外视图：元数据 + 现场重算的完整性结果；不内联包文件内容。"""
+    verification = snap_svc.verify_snapshot(snap)
+    out = dict(snap)
+    out["idempotent_replay"] = bool(replay or snap.get("idempotent_replay"))
+    out["verification"] = verification
+    return out
+
+
+@app.post("/api/audit/snapshots", tags=["audit-snapshots"])
+def create_snapshot(body: SnapshotBody, user=Depends(require_role("admin"))):
+    """按筛选条件与当前审计序号在服务端确定截止点冻结不可变快照。"""
+    filters = {"actor": body.actor, "action": body.action,
+               "study_id": body.study_id, "reid_id": body.reid_id,
+               "limit": body.limit}
+    try:
+        snap = snap_svc.create_snapshot(
+            user["username"], body.idempotency_key, filters)
+    except snap_svc.ChainBroken as exc:
+        # 原链已被篡改：拒绝冻结，返回可核对的确定状态
+        raise HTTPException(status_code=409, detail={
+            "error": "audit_chain_broken", "broken_at": exc.broken_at,
+            "chain_rows": exc.count,
+            "message": "refuse to freeze a tampered audit chain"})
+    except snap_svc.SnapshotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _snap_view(snap)
+
+
+@app.get("/api/audit/snapshots", tags=["audit-snapshots"])
+def list_snapshots(user=Depends(require_role("admin", "officer"))):
+    """隐私官可查询全部快照的范围/链锚/记录数/现场完整性结果（复核用）。"""
+    return [_snap_view(s) for s in snap_svc.list_snapshots()]
+
+
+@app.get("/api/audit/snapshots/{snapshot_id}", tags=["audit-snapshots"])
+def get_snapshot(snapshot_id: str,
+                 user=Depends(require_role("admin", "officer"))):
+    try:
+        snap = snap_svc.get_snapshot(snapshot_id)
+    except snap_svc.SnapshotNotFound:
+        raise HTTPException(404, "snapshot not found")
+    return _snap_view(snap)
+
+
+@app.get("/api/audit/snapshots/{snapshot_id}/pack", tags=["audit-snapshots"])
+def download_snapshot_pack(snapshot_id: str,
+                           user=Depends(require_role("admin"))):
+    """下载包含清单与记录的验真包；交付前强制验真，被改动则确定性拒绝。"""
+    try:
+        snap = snap_svc.get_snapshot(snapshot_id)
+        pack = snap_svc.get_verified_pack(snap)
+    except snap_svc.SnapshotNotFound:
+        raise HTTPException(404, "snapshot not found")
+    except snap_svc.PackTampered as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "verify_pack_tampered", "snapshot_id": snapshot_id,
+            "message": str(exc)})
+    store.audit(user["username"], "audit.snapshot.download",
+                detail={"snapshot_id": snapshot_id,
+                        "pack_cas_id": snap["pack_cas_id"]})
+    headers = {"Content-Disposition":
+               f'attachment; filename="audit-verify-{snapshot_id}.zip"'}
+    return Response(content=pack, media_type="application/zip",
+                    headers=headers)

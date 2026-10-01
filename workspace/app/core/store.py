@@ -172,6 +172,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
     prev_mac TEXT NOT NULL,
     mac TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audit_snapshots (
+    -- 验真快照：服务端在确定截止点（cutoff_seq）取数后冻结，永不更新。
+    -- idempotency_key 唯一：刷新/重复点击/并发创建都只能取回同一快照。
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    filters_json TEXT NOT NULL,
+    cutoff_seq INTEGER NOT NULL,
+    cutoff_ts TEXT,
+    anchor_mac TEXT NOT NULL,
+    record_count INTEGER NOT NULL,
+    first_seq INTEGER,
+    last_seq INTEGER,
+    pack_cas_id TEXT NOT NULL,
+    pack_size INTEGER NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    records_sha256 TEXT NOT NULL,
+    frozen_result_json TEXT NOT NULL
+);
 """
 
 
