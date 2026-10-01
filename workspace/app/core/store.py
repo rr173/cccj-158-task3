@@ -172,6 +172,29 @@ CREATE TABLE IF NOT EXISTS audit_log (
     prev_mac TEXT NOT NULL,
     mac TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audit_snapshots (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    cutoff_seq INTEGER NOT NULL,
+    cutoff_ts TEXT NOT NULL,
+    first_seq INTEGER,
+    last_seq INTEGER,
+    record_count INTEGER NOT NULL,
+    filters_json TEXT NOT NULL,
+    chain_ok INTEGER NOT NULL,
+    chain_broken_at INTEGER,
+    chain_count INTEGER NOT NULL,
+    anchor_prev_mac TEXT NOT NULL,
+    anchor_mac TEXT NOT NULL,
+    records_digest TEXT NOT NULL,
+    package_cas_id TEXT NOT NULL,
+    package_sha256 TEXT NOT NULL,
+    package_hmac TEXT NOT NULL,
+    package_size INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_snapshots_created ON audit_snapshots(created_at);
 """
 
 
@@ -278,7 +301,16 @@ def audit(actor: str, action: str, *, study_id: str | None = None,
 
 
 def verify_audit_chain() -> dict:
-    rows = all_rows("SELECT * FROM audit_log ORDER BY seq")
+    return _verify_audit_chain_on(get_conn())
+
+
+def _verify_audit_chain_on(conn: sqlite3.Connection) -> dict:
+    """在给定连接（含调用方事务快照）上重放整条哈希链。
+
+    快照创建必须在冻结事务内调用本函数：此时读到的就是确定截止点的链状态，
+    事务提交前并发写入的新事件不可见，也不会被纳入校验。
+    """
+    rows = conn.execute("SELECT * FROM audit_log ORDER BY seq").fetchall()
     prev = "GENESIS"
     for r in rows:
         canonical = json.dumps(

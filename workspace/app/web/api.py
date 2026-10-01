@@ -14,14 +14,14 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from ..core import dicomutil, store
 from ..services import (audit as audit_svc, ingest as ingest_svc,
                         policies as policies_svc, queue, reidentify,
-                        versions as versions_svc)
+                        snapshots as snap_svc, versions as versions_svc)
 from .auth import authenticate, require_role
 
 app = FastAPI(title="医学影像去标识化与受控回链平台", version="1.0.0")
@@ -414,3 +414,83 @@ def download_blob(cas_id: str, user=Depends(require_role("admin"))):
     except store.NotFound:
         raise HTTPException(404, "blob not found")
     return Response(content=data, media_type="application/octet-stream")
+
+
+# ---------- 审计验真快照（admin 冻结/下载；officer 仅查询/复核） ----------
+
+class SnapshotCreateBody(BaseModel):
+    idempotency_key: str = Field(..., description="客户端为本次冻结意图生成的唯一键；"
+                                                 "重复请求返回同一快照")
+    actor: Optional[str] = None
+    action: Optional[str] = None
+    study_id: Optional[str] = None
+    reid_id: Optional[str] = None
+
+
+@app.post("/api/audit/snapshots", tags=["audit-snapshots"])
+def audit_snapshot_create(body: SnapshotCreateBody,
+                          user=Depends(require_role("admin"))):
+    """服务端在确定截止点冻结筛选结果。刷新/重复点击/重试凭同幂等键取回原快照。"""
+    filters = {"actor": body.actor, "action": body.action,
+               "study_id": body.study_id, "reid_id": body.reid_id}
+    try:
+        view, created = snap_svc.create_snapshot(
+            user["username"], idempotency_key=body.idempotency_key, filters=filters)
+    except snap_svc.SnapshotConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except snap_svc.SnapshotError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # 新建 201；幂等重放 200，两者都返回同一份确定内容
+    return JSONResponse(status_code=201 if created else 200,
+                        content={**view, "created": created,
+                                 "idempotent_replay": not created})
+
+
+@app.get("/api/audit/snapshots", tags=["audit-snapshots"])
+def audit_snapshot_list(user=Depends(require_role("admin", "officer"))):
+    """快照登记册：范围、链锚、记录数、冻结点完整性。不含记录原文。"""
+    return snap_svc.list_snapshots()
+
+
+@app.get("/api/audit/snapshots/{snapshot_id}", tags=["audit-snapshots"])
+def audit_snapshot_detail(snapshot_id: str,
+                          user=Depends(require_role("admin", "officer"))):
+    try:
+        return snap_svc.get_snapshot(snapshot_id)
+    except store.NotFound:
+        raise HTTPException(404, "snapshot not found")
+
+
+@app.get("/api/audit/snapshots/{snapshot_id}/package", tags=["audit-snapshots"])
+def audit_snapshot_download(snapshot_id: str,
+                            user=Depends(require_role("admin"))):
+    """下载验真包（清单+记录）。仅 admin；officer 只能上传复核不能下载。"""
+    try:
+        data, view = snap_svc.get_package_bytes(snapshot_id)
+    except store.NotFound:
+        raise HTTPException(404, "snapshot not found")
+    store.audit(user["username"], "audit.snapshot.download",
+                detail={"snapshot_id": snapshot_id})
+    fname = f"audit-snapshot-{snapshot_id}.json"
+    return Response(
+        content=data, media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+@app.post("/api/audit/snapshots/review", tags=["audit-snapshots"])
+async def audit_snapshot_review(request: Request,
+                                expected_snapshot_id: Optional[str] = None,
+                                user=Depends(require_role("admin", "officer"))):
+    """复核一份验真包：签名/摘要/逐条 MAC/登记一致性/链完整性的确定结论。
+
+    隐私官可调用本接口但无法下载包原文；任何篡改都只回传可核对的判定，
+    不回传额外身份内容。
+    """
+    package = await request.body()
+    if not package:
+        raise HTTPException(status_code=400, detail="empty package payload")
+    result = snap_svc.review_package(
+        package, reviewer=user["username"],
+        expected_snapshot_id=expected_snapshot_id)
+    # 判定由 body.verdict 表达；包不合法/被篡改是"可核对的确定结果"，不用 5xx
+    return JSONResponse(status_code=200, content=result)

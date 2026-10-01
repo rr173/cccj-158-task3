@@ -621,11 +621,12 @@ const AuditView = {
   async load() {
     const prev = collectAuditFilters();
     const qs = new URLSearchParams(Object.entries(prev).filter(([, v]) => v)).toString();
-    let rows = [], verify = null;
+    let rows = [], verify = null, snaps = [];
     try {
-      [rows, verify] = await Promise.all([
+      [rows, verify, snaps] = await Promise.all([
         apiGet("/api/audit" + (qs ? "?" + qs : "")),
         apiGet("/api/audit/verify"),
+        apiGet("/api/audit/snapshots"),
       ]);
     } catch (e) { $("#view").innerHTML = errPanel(e); return; }
     const isAdmin = S.me.roles.includes("admin");
@@ -667,9 +668,79 @@ const AuditView = {
             </tr>`).join("") : emptyRow(8, "无匹配记录")}
           </tbody>
         </table>
+      </div>
+
+      <h2>验真快照（服务端冻结，不可变） <span class="count">${snaps.length} 份</span></h2>
+      <div class="banner info">
+        快照由<strong>服务端在确定截止点</strong>取数冻结：重复点击、刷新、网络重试凭同一幂等键
+        只取回原快照；冻结后并发写入的审计事件不会混入。每份快照都可下载/上传
+        <strong>验真包</strong>（清单+记录），包被改动或原链被篡改时复核给出确定结论。
+      </div>
+      <div class="card">
+        <div class="toolbar">
+          ${isAdmin ? `
+          <label>幂等键（同一冻结意图保持不变）
+            <input id="snap-key" placeholder="如 2026Q3-audit-relink-001"
+                   style="min-width:260px"></label>
+          <button class="btn btn-primary" data-act="snap-create"
+                  title="按上方筛选条件与当前审计序号冻结快照">
+            按当前筛选 + 当前审计序号冻结快照</button>
+          <span class="hint">筛选条件为空时将冻结<strong>全链</strong>快照（同样可核对）；
+            0 条匹配会得到记录数为 0 的空快照。</span>`
+          : `<span class="hint">隐私官仅可查询快照与复核验真包；
+               创建、下载由后端限定为 admin。</span>`}
+        </div>
+      </div>
+      <div class="card" style="padding:0;overflow:auto;">
+        <table>
+          <thead><tr><th>快照</th><th>创建时间 / 创建人</th><th>截止点</th>
+            <th>筛选 / 记录数</th><th>链锚</th><th>冻结点完整性</th>
+            <th>验真包</th><th>操作</th></tr></thead>
+          <tbody>${snaps.length ? snaps.map(snapshotRow).join("")
+            : emptyRow(8, "尚无快照")}
+          </tbody>
+        </table>
       </div>`;
   },
 };
+
+function snapshotRow(s) {
+  const fr = s.chain_verification_at_freeze || {};
+  const filt = Object.entries(s.filters || {});
+  return `
+    <tr>
+      <td class="mono">${esc(s.id)}<div class="hint">${esc(s.idempotency_key)}</div></td>
+      <td class="nowrap">${fmtTime(s.created_at)}<div class="hint">${esc(s.created_by)}</div></td>
+      <td class="nowrap">seq ≤ ${esc(s.cutoff_seq)}<div class="hint">${fmtTime(s.cutoff_ts)}</div></td>
+      <td>${filt.length ? filt.map(([k, v]) =>
+        `<span class="pill info">${esc(k)}=${esc(v)}</span>`).join(" ")
+        : '<span class="hint">全链（无筛选）</span>'}
+        <div><strong>${esc(s.record_count)}</strong> 条
+        ${s.empty ? '<span class="pill warn">空快照</span>' : ""}
+        <div class="hint">seq ${esc(s.first_seq ?? "—")} → ${esc(s.last_seq ?? "—")}</div></div>
+      </td>
+      <td class="mono" style="max-width:150px;overflow:hidden;text-overflow:ellipsis;"
+          title="first_prev=${esc(s.chain_anchor.first_prev_mac)}&#10;last=${esc(s.chain_anchor.last_mac)}">
+        ${esc(s.chain_anchor.last_mac)}</td>
+      <td>${fr.ok ? '<span class="pill ok">完整 ✓</span>'
+        : `<span class="pill bad">断裂于 seq ${esc(fr.broken_at)}</span>`}
+        <div class="hint">重放 ${esc(fr.count)} 条</div></td>
+      <td class="mono" style="max-width:130px;overflow:hidden;text-overflow:ellipsis;"
+          title="sha256=${esc(s.package.sha256)}&#10;hmac=${esc(s.package.hmac)}">
+        ${esc(s.package.sha256)}<div class="hint">${esc(s.package.size)} B</div></td>
+      <td class="nowrap">
+        <button class="btn btn-sm" data-act="snap-detail" data-sid="${esc(s.id)}">范围/详情</button>
+        <button class="btn btn-sm" data-act="snap-review-open" data-sid="${esc(s.id)}">
+          复核验真包</button>
+        ${isAdminSnapshot() ? `
+        <button class="btn btn-sm btn-primary" data-act="snap-download"
+                data-sid="${esc(s.id)}">下载验真包</button>` : ""}
+      </td>
+    </tr>`;
+}
+function isAdminSnapshot() {
+  return !!(S.me && S.me.roles.includes("admin"));
+}
 
 function collectAuditFilters() {
   const g = (id) => ($("#" + id)?.value || "").trim();
@@ -905,6 +976,81 @@ document.addEventListener("click", async (e) => {
         await TABS[S.tab].load();
         break;
       }
+      // ---- 验真快照 ----
+      case "snap-create": {
+        const key = $("#snap-key").value.trim();
+        if (!key) { toast("请填写幂等键：同一冻结意图必须复用同一个键"); break; }
+        const f = collectAuditFilters();
+        await withBtn(btn, "snap-create:" + key, async () => {
+          const r = await apiPost("/api/audit/snapshots", {
+            idempotency_key: key,
+            actor: f.actor || null, action: f.action || null,
+            study_id: f.study || null, reid_id: f.reid || null,
+          });
+          if (r.idempotent_replay) {
+            toast(`幂等重放：返回原快照 ${r.id}（${r.record_count} 条，截止 seq ${r.cutoff_seq}）`, "");
+          } else {
+            toast(`已冻结快照 ${r.id}：${r.record_count} 条，截止 seq ${r.cutoff_seq}，`
+              + `链 ${r.chain_verification_at_freeze.ok ? "完整" : "断裂"}`, "ok");
+          }
+          await openSnapshotDetail(r.id, true);
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "snap-detail":
+        await openSnapshotDetail(btn.dataset.sid);
+        break;
+      case "snap-download": {
+        const sid = btn.dataset.sid;
+        await withBtn(btn, "snap-download:" + sid, async () => {
+          const blob = await apiBlob(`/api/audit/snapshots/${sid}/package`);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${sid}.json`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 4000);
+          toast("验真包已下载（WORM 内容寻址；改动后复核会判定 package_tampered）", "ok");
+        });
+        break;
+      }
+      case "snap-review-open":
+        openSnapshotReview(btn.dataset.sid);
+        break;
+      case "snap-review-submit": {
+        const sid = btn.dataset.sid;
+        const file = $("#review-file").files[0];
+        const useServer = $("#review-server-copy").checked;
+        await withBtn(btn, "snap-review:" + sid + ":" + (file ? file.name : "server"),
+          async () => {
+            let body, ctype;
+            if (useServer || !file) {
+              const blob = await apiBlob(`/api/audit/snapshots/${sid}/package`)
+                .catch((e) => {
+                  if (e.message === "HTTP 403")
+                    throw new Error("隐私官无权下载包原文：请改用“选择本地验真包文件”上传复核");
+                  throw e;
+                });
+              body = await blob.arrayBuffer();
+            } else {
+              body = await file.arrayBuffer();
+            }
+            const res = await fetch(
+              `/api/audit/snapshots/review?expected_snapshot_id=${encodeURIComponent(sid)}`,
+              { method: "POST", headers: {
+                Authorization: "Basic " + S.auth,
+                "Content-Type": "application/octet-stream" },
+                body });
+            const payload = await res.json().catch(() => null);
+            if (res.status === 401) { sessionExpired(); throw new Error("登录已失效"); }
+            if (!res.ok) throw new Error(payload?.detail || ("HTTP " + res.status));
+            renderReviewResult(payload);
+          });
+        break;
+      }
       case "modal-close":
         closeModal();
         break;
@@ -1083,6 +1229,107 @@ async function openRelinkDetail(rid) {
     <h3>原始记录（无身份内容）</h3>
     <pre>${esc(JSON.stringify(r, null, 2))}</pre>
     <div class="dlg-actions"><button class="btn" data-act="modal-close">关闭</button></div>`);
+}
+
+// ---------- 验真快照弹层（内容均取自服务端） ----------
+
+const VERDICT_TEXT = {
+  verified: ["ok", "验真通过：包签名、记录摘要、逐条 MAC、登记快照与链完整性全部一致。"],
+  package_tampered: ["bad", "验真包已被改动：签名/摘要/逐条 MAC 至少一项不一致，内容不可采信。"],
+  chain_broken: ["warn", "验真包本身完整，但审计哈希链在冻结点或当前重放中已断裂（原链被篡改）。"],
+  snapshot_mismatch: ["bad", "验真包与登记快照/期望快照不一致：可能被替换为另一份快照的包。"],
+  invalid_package: ["bad", "不是合法的验真包（无法解析或结构缺失）。"],
+};
+
+async function openSnapshotDetail(sid, justCreated) {
+  const s = await apiGet(`/api/audit/snapshots/${sid}`);
+  const fr = s.chain_verification_at_freeze || {};
+  const filt = Object.entries(s.filters || {});
+  openModal(`
+    <h2>验真快照 ${esc(s.id)} ${justCreated ? '<span class="pill ok">已冻结</span>' : ""}</h2>
+    <div class="banner ${fr.ok ? "info" : "danger"}">
+      本快照在 <strong>${fmtTime(s.created_at)}</strong> 由服务端在截止点
+      <strong>seq ≤ ${esc(s.cutoff_seq)}</strong>（${fmtTime(s.cutoff_ts)}）一次性冻结；
+      之后写入的审计事件不在其中。冻结点链完整性：
+      ${fr.ok ? "完整 ✓（重放 " + esc(fr.count) + " 条）"
+              : "断裂于 seq " + esc(fr.broken_at)}。
+    </div>
+    <dl class="kv">
+      <dt>幂等键</dt><dd class="mono">${esc(s.idempotency_key)}</dd>
+      <dt>创建人</dt><dd>${esc(s.created_by)}</dd>
+      <dt>筛选范围</dt><dd>${filt.length ? filt.map(([k, v]) =>
+        `<span class="pill info">${esc(k)}=${esc(v)}</span>`).join(" ")
+        : "全链（无筛选条件）"}</dd>
+      <dt>记录数</dt><dd><strong>${esc(s.record_count)}</strong> 条
+        （seq ${esc(s.first_seq ?? "—")} → ${esc(s.last_seq ?? "—")}）
+        ${s.empty ? '<span class="pill warn">空快照：0 条匹配，范围仍可核对</span>' : ""}</dd>
+      <dt>链锚 first_prev</dt><dd class="mono">${esc(s.chain_anchor.first_prev_mac)}</dd>
+      <dt>链锚 last_mac</dt><dd class="mono">${esc(s.chain_anchor.last_mac)}</dd>
+      <dt>记录集摘要</dt><dd class="mono">${esc(s.records_digest)}</dd>
+      <dt>验真包 sha256</dt><dd class="mono">${esc(s.package.sha256)}</dd>
+      <dt>验真包签名</dt><dd class="mono">${esc(s.package.hmac)}</dd>
+      <dt>包大小</dt><dd>${esc(s.package.size)} 字节（WORM，0444）</dd>
+    </dl>
+    <div class="dlg-actions">
+      <button class="btn" data-act="snap-review-open" data-sid="${esc(s.id)}">复核验真包</button>
+      ${S.me.roles.includes("admin") ? `
+      <button class="btn btn-primary" data-act="snap-download"
+              data-sid="${esc(s.id)}">下载验真包</button>` : ""}
+      <button class="btn" data-act="modal-close">关闭</button>
+    </div>`);
+}
+
+function openSnapshotReview(sid) {
+  const isAdmin = S.me.roles.includes("admin");
+  openModal(`
+    <h2>复核验真包 · ${esc(sid)}</h2>
+    <p class="hint">服务端重算包 HMAC 签名、记录集摘要、逐条审计 MAC，并与登记快照元数据、
+      当前哈希链实时重放结果比对。包被改动、被替换或原链被篡改都会得到确定结论。</p>
+    ${isAdmin ? `
+    <label class="hint" style="display:flex;align-items:center;gap:8px;">
+      <input type="checkbox" id="review-server-copy" checked
+             style="width:auto;margin:0;">直接复核服务端 WORM 中的原始包（管理员）</label>` : ""}
+    <label>选择本地验真包文件（隐私官复核管理员下载后交来的包）
+      <input type="file" id="review-file" accept=".json,application/json"></label>
+    <p class="hint">复核只返回判定与核对项，不返回额外身份内容；复核动作本身写入审计链。</p>
+    <div id="review-result"></div>
+    <div class="dlg-actions">
+      <button class="btn" data-act="modal-close">关闭</button>
+      <button class="btn btn-primary" data-act="snap-review-submit"
+              data-sid="${esc(sid)}">开始复核</button>
+    </div>`);
+}
+
+function renderReviewResult(r) {
+  const [kind, text] = VERDICT_TEXT[r.verdict] || ["bad", "未知判定：" + r.verdict];
+  const f = r.findings || {};
+  const row = (label, ok) => `<tr><td>${esc(label)}</td>
+    <td>${ok === true ? '<span class="pill ok">一致 ✓</span>'
+      : ok === false ? '<span class="pill bad">不一致 ✗</span>'
+      : '<span class="pill">—</span>'}</td></tr>`;
+  const sfm = f.snapshot_fields_match || {};
+  const fr = f.chain_verification_at_freeze || {};
+  const now = f.chain_verification_now || {};
+  $("#review-result").innerHTML = `
+    <div class="banner ${kind === "ok" ? "info" : kind === "warn" ? "" : "danger"}">
+      <strong>判定：${esc(r.verdict)}</strong> — ${esc(text)}</div>
+    <table>
+      <thead><tr><th>核对项</th><th>结果</th></tr></thead>
+      <tbody>
+        ${row("服务端 HMAC 签名（包字节未改动）", f.package_hmac_ok)}
+        ${row("记录集摘要（无漏条/混入/重排）", f.records_digest_ok)}
+        ${row("记录数/seq 范围/链锚自洽",
+          f.record_count_consistent && f.range_consistent && f.chain_anchor_consistent)}
+        ${row("逐条记录审计 MAC", f.record_self_mac_ok)}
+        ${row("与登记快照冻结集一致", f.frozen_set_ok)}
+        ${row("快照元数据/WORM 字节一致",
+          f.snapshot_fields_match ? Object.values(sfm).every(Boolean) : null)}
+        ${row("冻结点链完整", fr.ok)}
+        ${row("当前链实时重放完整", now.ok)}
+      </tbody>
+    </table>
+    <details><summary class="hint">完整核对明细（JSON）</summary>
+      <pre>${esc(JSON.stringify(f, null, 2))}</pre></details>`;
 }
 
 // ---------- 启动：恢复会话与真实状态 ----------

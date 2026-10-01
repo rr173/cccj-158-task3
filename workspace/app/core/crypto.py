@@ -140,5 +140,15 @@ def audit_mac(prev_mac: str, canonical_row: str) -> str:
     return hmac.new(_audit_key(), (prev_mac + "." + canonical_row).encode(), hashlib.sha256).hexdigest()
 
 
+def snapshot_package_hmac(canonical_manifest_and_records: str) -> str:
+    """验真包服务端签名：与审计链同密钥，对包的规范化字节做 HMAC-SHA256。
+
+    任何对包内清单或记录的改动都会使复核时重算的签名不一致；
+    签名只证明"该包由持有审计密钥的服务端在冻结点签发"，不含任何身份内容。
+    """
+    return hmac.new(_audit_key(), canonical_manifest_and_records.encode(),
+                    hashlib.sha256).hexdigest()
+
+
 def hmac_compare(a: str, b: str) -> bool:
     return hmac.compare_digest(a, b)
